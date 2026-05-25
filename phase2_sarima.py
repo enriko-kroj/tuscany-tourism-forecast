@@ -258,7 +258,7 @@ for ax, city in zip(axes, CITIES):
 
     # Metrics annotation
     row = results_df[results_df["city"] == city].iloc[0]
-    order_str = f"ARIMA({row.p},{row.d},{row.q})({row.P},{row.D},{row.Q})[12]"
+    order_str = f"SARIMA({row.p},{row.d},{row.q})({row.P},{row.D},{row.Q})[12]"
     metrics_str = f"Test RMSE={row.Test_RMSE:.1f}  MAE={row.Test_MAE:.1f}  MAPE={row.Test_MAPE:.1f}%"
     ax.set_title(f"{city} — {order_str}   |   {metrics_str}",
                  fontsize=10, fontweight="bold", loc="left")
