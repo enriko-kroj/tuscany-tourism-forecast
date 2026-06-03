@@ -145,7 +145,7 @@ for city in CITIES:
             s_rmse = rmse(test, s_fc)
             s_mae  = mae(test, s_fc)
             s_mape = mape(test, s_fc)
-            s_r2   = float(r2_score(test, s_fc))
+            s_r2   = float(np.clip(r2_score(test, s_fc), -1, 1))
         except Exception as exc:
             print(f"SARIMA ERR: {exc}", end="  ")
             s_rmse = s_mae = s_mape = s_r2 = np.nan
@@ -194,7 +194,7 @@ for city in CITIES:
         l_rmse = rmse(test, l_fc)
         l_mae  = mae(test, l_fc)
         l_mape = mape(test, l_fc)
-        l_r2   = float(r2_score(test, l_fc))
+        l_r2   = float(np.clip(r2_score(test, l_fc), -1, 1))
 
         tf.keras.backend.clear_session()
 
