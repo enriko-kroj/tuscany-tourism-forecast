@@ -6,7 +6,9 @@ BSP4 Phase 4: Walk-Forward Rolling Window Validation
   Last window  : train Aug2020–Jul2023, test Aug2023–Jul2024
 - SARIMA: fixed orders from phase2 (sarima_results_full.csv), re-fit per window
 - LSTM : LSTM(64,32)+Dropout(0.2), seq_len=12, same as phase3
-- Outputs: rolling_window_results.csv, rolling_window_plot.png
+- R²   : pooled across all 20 windows (single value per city per model)
+- Outputs: rolling_window_results.csv, rolling_window_plot.png,
+           rolling_window_r2_plot.png
 """
 
 import os, warnings
@@ -105,7 +107,8 @@ print("=" * 65)
 # ─────────────────────────────────────────────
 # WALK-FORWARD LOOP
 # ─────────────────────────────────────────────
-all_rows = []
+all_rows  = []
+pooled_r2 = {}   # city → {"sarima": float, "lstm": float}
 
 for city in CITIES:
     print(f"\n{'─'*65}")
@@ -119,6 +122,10 @@ for city in CITIES:
     o = sarima_orders.loc[city]
     s_order    = (o.p, o.d, o.q)
     s_seasonal = (o.P, o.D, o.Q, 12)
+
+    # Accumulators for pooled R²
+    sarima_actuals, sarima_preds = [], []
+    lstm_actuals,   lstm_preds   = [], []
 
     for w in range(n_windows):
         tr_sl = slice(w,          w + TRAIN_W)
@@ -145,10 +152,11 @@ for city in CITIES:
             s_rmse = rmse(test, s_fc)
             s_mae  = mae(test, s_fc)
             s_mape = mape(test, s_fc)
-            s_r2   = float(np.clip(r2_score(test, s_fc), -1, 1))
+            sarima_actuals.extend(test.tolist())
+            sarima_preds.extend(s_fc.tolist())
         except Exception as exc:
             print(f"SARIMA ERR: {exc}", end="  ")
-            s_rmse = s_mae = s_mape = s_r2 = np.nan
+            s_rmse = s_mae = s_mape = np.nan
 
         # ── LSTM ──────────────────────────────────────────────
         scaler   = MinMaxScaler()
@@ -194,11 +202,12 @@ for city in CITIES:
         l_rmse = rmse(test, l_fc)
         l_mae  = mae(test, l_fc)
         l_mape = mape(test, l_fc)
-        l_r2   = float(np.clip(r2_score(test, l_fc), -1, 1))
+        lstm_actuals.extend(test.tolist())
+        lstm_preds.extend(l_fc.tolist())
 
         tf.keras.backend.clear_session()
 
-        print(f"SARIMA MAPE={s_mape:.1f}% R²={s_r2:.3f}  LSTM MAPE={l_mape:.1f}% R²={l_r2:.3f}")
+        print(f"SARIMA MAPE={s_mape:.1f}%  LSTM MAPE={l_mape:.1f}%")
 
         all_rows.append({
             "city":          city,
@@ -210,23 +219,37 @@ for city in CITIES:
             "sarima_rmse":   round(s_rmse, 2),
             "sarima_mae":    round(s_mae,  2),
             "sarima_mape":   round(s_mape, 2),
-            "sarima_r2":     round(s_r2,   4),
             "lstm_rmse":     round(l_rmse, 2),
             "lstm_mae":      round(l_mae,  2),
             "lstm_mape":     round(l_mape, 2),
-            "lstm_r2":       round(l_r2,   4),
         })
+
+    # Pooled R² across all windows for this city
+    s_pooled = float(r2_score(sarima_actuals, sarima_preds)) if sarima_actuals else np.nan
+    l_pooled = float(r2_score(lstm_actuals,   lstm_preds))   if lstm_actuals   else np.nan
+    pooled_r2[city] = {"sarima": s_pooled, "lstm": l_pooled}
+    print(f"  → Pooled R²:  SARIMA={s_pooled:.4f}  LSTM={l_pooled:.4f}")
+
+# ─────────────────────────────────────────────
+# BUILD DATAFRAME & MERGE POOLED R²
+# ─────────────────────────────────────────────
+results_df = pd.DataFrame(all_rows)
+
+r2_lookup = pd.DataFrame([
+    {"city": c, "sarima_pooled_r2": round(v["sarima"], 4), "lstm_pooled_r2": round(v["lstm"], 4)}
+    for c, v in pooled_r2.items()
+])
+results_df = results_df.merge(r2_lookup, on="city", how="left")
 
 # ─────────────────────────────────────────────
 # SAVE CSV
 # ─────────────────────────────────────────────
-results_df = pd.DataFrame(all_rows)
 csv_path = os.path.join(OUTPUT_DIR, "rolling_window_results.csv")
 results_df.to_csv(csv_path, index=False)
 print(f"\nSaved → {csv_path}")
 
 # ─────────────────────────────────────────────
-# PLOT 1: rolling_window_plot.png  (MAPE)
+# PLOT 1: rolling_window_plot.png  (MAPE per window)
 # ─────────────────────────────────────────────
 windows = np.arange(1, n_windows + 1)
 first_city_rows = results_df[results_df["city"] == CITIES[0]].sort_values("window_number")
@@ -269,41 +292,41 @@ plt.close()
 print(f"Saved → {plot_path}")
 
 # ─────────────────────────────────────────────
-# PLOT 2: rolling_window_r2_plot.png  (R²)
+# PLOT 2: rolling_window_r2_plot.png  (pooled R² bar chart)
 # ─────────────────────────────────────────────
-fig, axes = plt.subplots(5, 1, figsize=(14, 18), sharex=True)
-fig.suptitle(
-    f"Walk-Forward Rolling Window Validation — R² per Window\n"
-    f"(Train={TRAIN_W}m, Test={TEST_W}m, slide=1m, {n_windows} windows | 5 Tuscan cities)",
-    fontsize=13, fontweight="bold", y=0.99,
+x      = np.arange(len(CITIES))
+width  = 0.35
+s_r2s  = [pooled_r2[c]["sarima"] for c in CITIES]
+l_r2s  = [pooled_r2[c]["lstm"]   for c in CITIES]
+
+fig, ax = plt.subplots(figsize=(10, 5))
+bars_s = ax.bar(x - width / 2, s_r2s, width, label="SARIMA", color="#4e79a7", edgecolor="white")
+bars_l = ax.bar(x + width / 2, l_r2s, width, label="LSTM",   color="#f28e2b", edgecolor="white")
+
+ax.set_title(
+    f"Walk-Forward Rolling Window Validation — Pooled R² per City\n"
+    f"(Train={TRAIN_W}m, Test={TEST_W}m, slide=1m, {n_windows} windows pooled | 5 Tuscan cities)",
+    fontsize=12, fontweight="bold",
 )
+ax.set_ylabel("Pooled R²", fontsize=10)
+ax.set_xlabel("City", fontsize=10)
+ax.set_xticks(x)
+ax.set_xticklabels(CITIES, fontsize=10)
+ax.axhline(0, color="black", linestyle=":", linewidth=0.9, alpha=0.6)
+ax.legend(fontsize=10)
+ax.grid(axis="y", linestyle="--", alpha=0.35)
 
-for ax, city in zip(axes, CITIES):
-    city_res = results_df[results_df["city"] == city].sort_values("window_number")
-    s_r2s    = city_res["sarima_r2"].values
-    l_r2s    = city_res["lstm_r2"].values
-    s_mean, l_mean = np.nanmean(s_r2s), np.nanmean(l_r2s)
+# Value labels on bars
+for bar in bars_s:
+    v = bar.get_height()
+    ax.text(bar.get_x() + bar.get_width() / 2, v + 0.01 if v >= 0 else v - 0.03,
+            f"{v:.3f}", ha="center", va="bottom" if v >= 0 else "top", fontsize=8)
+for bar in bars_l:
+    v = bar.get_height()
+    ax.text(bar.get_x() + bar.get_width() / 2, v + 0.01 if v >= 0 else v - 0.03,
+            f"{v:.3f}", ha="center", va="bottom" if v >= 0 else "top", fontsize=8)
 
-    ax.plot(windows, s_r2s, color="#4e79a7", linewidth=1.8, marker="o", markersize=4, label="SARIMA")
-    ax.plot(windows, l_r2s, color="#f28e2b", linewidth=1.8, marker="s", markersize=4, label="LSTM")
-    ax.axhline(s_mean, color="#4e79a7", linestyle="--", linewidth=0.9, alpha=0.6)
-    ax.axhline(l_mean, color="#f28e2b", linestyle="--", linewidth=0.9, alpha=0.6)
-    # Reference line at R²=0 (model no better than predicting the mean)
-    ax.axhline(0, color="black", linestyle=":", linewidth=0.8, alpha=0.5)
-    ax.set_title(
-        f"{city} — SARIMA mean={s_mean:.3f}  std={np.nanstd(s_r2s):.3f}   |   "
-        f"LSTM mean={l_mean:.3f}  std={np.nanstd(l_r2s):.3f}",
-        fontsize=9, fontweight="bold", loc="left",
-    )
-    ax.set_ylabel("R²", fontsize=8)
-    ax.tick_params(axis="y", labelsize=8)
-    ax.grid(axis="y", linestyle="--", alpha=0.35)
-    ax.legend(loc="lower right", fontsize=8)
-
-axes[-1].set_xticks(windows)
-axes[-1].set_xticklabels(tick_labels, rotation=45, ha="right", fontsize=7)
-axes[-1].set_xlabel("Test window start (YYYY-MM)", fontsize=9)
-plt.tight_layout(rect=[0, 0, 1, 0.97])
+plt.tight_layout()
 r2_plot_path = os.path.join(OUTPUT_DIR, "rolling_window_r2_plot.png")
 plt.savefig(r2_plot_path, dpi=150, bbox_inches="tight")
 plt.close()
@@ -316,7 +339,7 @@ print("\n" + "=" * 78)
 print("ROLLING WINDOW SUMMARY — Mean ± Std across all windows per city")
 print("=" * 78)
 
-# Block 1: RMSE / MAE / MAPE
+# Block 1: RMSE / MAE / MAPE (per-window averages)
 header = f"{'City':<10}  {'SARIMA':^33}  {'LSTM':^33}"
 sub    = f"{'':10}  {'RMSE':>10}  {'MAE':>10}  {'MAPE':>9}  {'RMSE':>10}  {'MAE':>10}  {'MAPE':>9}"
 print(header)
@@ -334,20 +357,16 @@ for city in CITIES:
         f"{r.lstm_mape.mean():>6.1f}±{r.lstm_mape.std():>4.1f}%"
     )
 
-# Block 2: R²
+# Block 2: Pooled R² (single value per city)
 print()
-r2_header = f"{'City':<10}  {'SARIMA R²':^20}  {'LSTM R²':^20}"
-r2_sub    = f"{'':10}  {'mean':>9}  {'std':>9}  {'mean':>9}  {'std':>9}"
+print("POOLED R² — Single value computed over all 20 windows combined")
+r2_header = f"{'City':<10}  {'SARIMA R²':>12}  {'LSTM R²':>12}"
 print(r2_header)
-print(r2_sub)
-print("-" * 52)
+print("-" * 38)
 for city in CITIES:
-    r = results_df[results_df["city"] == city]
-    print(
-        f"{city:<10}  "
-        f"{r.sarima_r2.mean():>9.4f}  {r.sarima_r2.std():>9.4f}  "
-        f"{r.lstm_r2.mean():>9.4f}  {r.lstm_r2.std():>9.4f}"
-    )
+    s_r2 = pooled_r2[city]["sarima"]
+    l_r2 = pooled_r2[city]["lstm"]
+    print(f"{city:<10}  {s_r2:>12.4f}  {l_r2:>12.4f}")
 
 print("=" * 78)
 print(f"\nPHASE 4 COMPLETE")
