@@ -1,3 +1,7 @@
+import os
+os.environ["PYTHONHASHSEED"] = "42"
+os.environ["TF_DETERMINISTIC_OPS"] = "1"
+
 """
 BSP4 Phase 4: Walk-Forward Rolling Window Validation
 - Train window: 36 months  |  Test window: 12 months  |  Slide: 1 month
@@ -24,6 +28,13 @@ import tensorflow as tf
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout
 from tensorflow.keras.callbacks import EarlyStopping
+
+import random
+random.seed(42)
+import numpy as np
+np.random.seed(42)
+import tensorflow as tf
+tf.random.set_seed(42)
 
 warnings.filterwarnings("ignore")
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
