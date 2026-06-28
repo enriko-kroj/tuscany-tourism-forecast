@@ -1,9 +1,9 @@
 """
-BSP4 Phase 3: LSTM Modelling
+BSP4 Phase 3: LSTM Modelling — v2 (seasonal differencing + smaller network)
+- Seasonal differencing lag=12 before scaling (stationarises the series)
+- Architecture: LSTM(16) → Dropout(0.2) → LSTM(8) → Dropout(0.2) → Dense(1)
 - Sequence length 12, same train/test split as SARIMA (test = last 12 months)
-- Architecture: LSTM(64) → Dropout(0.2) → LSTM(32) → Dropout(0.2) → Dense(1)
-- MinMaxScaler per city, EarlyStopping patience=20
-- Train metrics on in-sample fitted sequence, test via rolling multi-step forecast
+- MinMaxScaler on differenced series, EarlyStopping patience=20
 - Outputs: lstm_results_full.csv, lstm_forecasts.png, lstm_vs_sarima.csv, lstm_comparison.png
 """
 
@@ -15,6 +15,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import r2_score
+import pmdarima as pm
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout
@@ -30,6 +32,7 @@ SARIMA_CSV = os.path.expanduser("~/Desktop/BSP4_Statistics/sarima_results_full.c
 OUTPUT_DIR = os.path.expanduser("~/Desktop/BSP4_Statistics")
 CITIES     = ["Arezzo", "Firenze", "Lucca", "Pisa", "Siena"]
 SEQ_LEN    = 12
+SEAS_LAG   = 12
 TEST_N     = 12
 EPOCHS     = 500
 BATCH_SIZE = 16
@@ -73,14 +76,14 @@ df = df.sort_values(["city", "date"]).reset_index(drop=True)
 results_rows   = []
 city_artifacts = {}
 
-print("=" * 60)
-print("PHASE 3: LSTM — seq_len=12, LSTM(64,32), dropout=0.2")
-print("=" * 60)
+print("=" * 65)
+print("PHASE 3: LSTM — seas_diff(12), LSTM(16,8), dropout=0.2")
+print("=" * 65)
 
 for city in CITIES:
-    print(f"\n{'─'*50}")
+    print(f"\n{'─'*55}")
     print(f"  {city}")
-    print(f"{'─'*50}")
+    print(f"{'─'*55}")
 
     city_df = df[df["city"] == city].reset_index(drop=True)
     series  = city_df["tourist_volume"].values.astype(float)
@@ -91,24 +94,33 @@ for city in CITIES:
     test        = series[n - TEST_N :]
     train_dates = dates[: n - TEST_N]
     test_dates  = dates[n - TEST_N :]
+    n_train     = len(train)
 
-    print(f"  Train: {len(train)} months  ({pd.Timestamp(train_dates[0]).strftime('%Y-%m')} – {pd.Timestamp(train_dates[-1]).strftime('%Y-%m')})")
-    print(f"  Test : {len(test)}  months  ({pd.Timestamp(test_dates[0]).strftime('%Y-%m')} – {pd.Timestamp(test_dates[-1]).strftime('%Y-%m')})")
+    print(f"  Train: {n_train} months  "
+          f"({pd.Timestamp(train_dates[0]).strftime('%Y-%m')} – "
+          f"{pd.Timestamp(train_dates[-1]).strftime('%Y-%m')})")
+    print(f"  Test : {len(test)}  months  "
+          f"({pd.Timestamp(test_dates[0]).strftime('%Y-%m')} – "
+          f"{pd.Timestamp(test_dates[-1]).strftime('%Y-%m')})")
 
-    # ── Scale ────────────────────────────────────────────────
+    # ── Seasonal differencing (lag=12) on the training series ──
+    # diff_train[j] = train[j+12] - train[j], j = 0..n_train-13
+    diff_train = train[SEAS_LAG:] - train[:-SEAS_LAG]   # shape (n_train-12,)
+
+    # ── Scale the differenced series ──────────────────────────
     scaler        = MinMaxScaler()
-    train_scaled  = scaler.fit_transform(train.reshape(-1, 1)).flatten()
+    diff_train_sc = scaler.fit_transform(diff_train.reshape(-1, 1)).flatten()
 
-    # ── Sequences ────────────────────────────────────────────
-    X_tr, y_tr = make_sequences(train_scaled, SEQ_LEN)
+    # ── Sequences on differenced, scaled series ───────────────
+    X_tr, y_tr = make_sequences(diff_train_sc, SEQ_LEN)
     X_tr = X_tr.reshape(X_tr.shape[0], SEQ_LEN, 1)
 
-    # ── Model ────────────────────────────────────────────────
+    # ── Smaller model ─────────────────────────────────────────
     tf.random.set_seed(SEED)
     model = Sequential([
-        LSTM(64, return_sequences=True, input_shape=(SEQ_LEN, 1)),
+        LSTM(16, return_sequences=True, input_shape=(SEQ_LEN, 1)),
         Dropout(0.2),
-        LSTM(32),
+        LSTM(8),
         Dropout(0.2),
         Dense(1),
     ])
@@ -119,7 +131,7 @@ for city in CITIES:
         restore_best_weights=True, verbose=0,
     )
 
-    history = model.fit(
+    model.fit(
         X_tr, y_tr,
         epochs=EPOCHS,
         batch_size=BATCH_SIZE,
@@ -130,69 +142,136 @@ for city in CITIES:
     stopped_epoch = early_stop.stopped_epoch if early_stop.stopped_epoch > 0 else EPOCHS
     print(f"  Stopped at epoch {stopped_epoch}")
 
-    # ── In-sample train predictions ──────────────────────────
-    train_pred_sc  = model.predict(X_tr, verbose=0).flatten()
-    train_pred     = scaler.inverse_transform(train_pred_sc.reshape(-1, 1)).flatten()
-    train_pred     = np.maximum(train_pred, 0)
-    train_actual   = train[SEQ_LEN:]   # aligned: first SEQ_LEN points have no prediction
+    # ── In-sample train predictions ───────────────────────────
+    # model.predict(X_tr)[i] predicts diff_train[i + SEQ_LEN]
+    #   = train[i + SEQ_LEN + SEAS_LAG] - train[i + SEQ_LEN]
+    # Invert: pred_orig[i] = pred_diff[i] + train[i + SEQ_LEN]
+    # Actual:              = train[i + SEQ_LEN + SEAS_LAG]
+    train_pred_sc   = model.predict(X_tr, verbose=0).flatten()
+    train_diff_pred = scaler.inverse_transform(train_pred_sc.reshape(-1, 1)).flatten()
+    n_insample      = len(train_diff_pred)
+    train_pred      = train_diff_pred + train[SEQ_LEN : SEQ_LEN + n_insample]
+    train_pred      = np.maximum(train_pred, 0)
+    train_actual    = train[SEQ_LEN + SEAS_LAG :]  # = train[24:]
 
-    # ── Rolling multi-step test forecast ────────────────────
-    rolling = list(train_scaled[-SEQ_LEN:])
-    test_pred_sc = []
+    # ── Rolling multi-step test forecast ──────────────────────
+    # Seed with last SEQ_LEN values of differenced scaled train
+    rolling = list(diff_train_sc[-SEQ_LEN:])
+    test_diff_sc = []
     for _ in range(TEST_N):
         x_in = np.array(rolling[-SEQ_LEN:]).reshape(1, SEQ_LEN, 1)
         p    = model.predict(x_in, verbose=0)[0, 0]
-        test_pred_sc.append(p)
+        test_diff_sc.append(p)
         rolling.append(p)
 
-    test_pred = scaler.inverse_transform(
-        np.array(test_pred_sc).reshape(-1, 1)
+    test_diff_pred = scaler.inverse_transform(
+        np.array(test_diff_sc).reshape(-1, 1)
     ).flatten()
+
+    # Invert seasonal differencing:
+    # test_pred[k] = test_diff_pred[k] + series[t - 12]
+    # where t = n_train + k, so series[t-12] = train[n_train - 12 + k] = train[-TEST_N + k]
+    # Since SEAS_LAG == TEST_N == 12, this is simply train[-12:]
+    test_pred = test_diff_pred + train[n_train - SEAS_LAG :]
     test_pred = np.maximum(test_pred, 0)
 
-    # ── Metrics ──────────────────────────────────────────────
+    # ── Metrics ───────────────────────────────────────────────
     tr_r  = rmse(train_actual, train_pred)
     tr_m  = mae(train_actual, train_pred)
     tr_mp = mape(train_actual, train_pred)
+    tr_r2 = float(r2_score(train_actual, train_pred))
     te_r  = rmse(test, test_pred)
     te_m  = mae(test, test_pred)
     te_mp = mape(test, test_pred)
+    te_r2 = float(r2_score(test, test_pred))
 
-    print(f"  Train RMSE={tr_r:.2f}  MAE={tr_m:.2f}  MAPE={tr_mp:.2f}%")
-    print(f"  Test  RMSE={te_r:.2f}  MAE={te_m:.2f}  MAPE={te_mp:.2f}%")
+    print(f"  Train RMSE={tr_r:.2f}  MAE={tr_m:.2f}  MAPE={tr_mp:.2f}%  R²={tr_r2:.4f}")
+    print(f"  Test  RMSE={te_r:.2f}  MAE={te_m:.2f}  MAPE={te_mp:.2f}%  R²={te_r2:.4f}")
 
     results_rows.append({
         "city":       city,
         "Train_RMSE": round(tr_r,  2),
         "Train_MAE":  round(tr_m,  2),
         "Train_MAPE": round(tr_mp, 2),
+        "Train_R2":   round(tr_r2, 4),
         "Test_RMSE":  round(te_r,  2),
         "Test_MAE":   round(te_m,  2),
         "Test_MAPE":  round(te_mp, 2),
+        "Test_R2":    round(te_r2, 4),
     })
 
     city_artifacts[city] = {
-        "train":       train,
-        "test":        test,
-        "train_pred":  train_pred,
-        "test_pred":   test_pred,
-        "train_dates": train_dates,
-        "test_dates":  test_dates,
+        "train":             train,
+        "test":              test,
+        "train_pred":        train_pred,
+        "test_pred":         test_pred,
+        "train_dates":       train_dates,
+        "test_dates":        test_dates,
+        "insample_dates":    train_dates[SEQ_LEN + SEAS_LAG:],
     }
 
-# ── Save lstm_results_full.csv ───────────────────────────────
-results_df  = pd.DataFrame(results_rows)
-lstm_path   = os.path.join(OUTPUT_DIR, "lstm_results_full.csv")
+# ── Save lstm_results_full.csv ────────────────────────────────
+results_df = pd.DataFrame(results_rows)
+lstm_path  = os.path.join(OUTPUT_DIR, "lstm_results_full.csv")
 results_df.to_csv(lstm_path, index=False)
 print(f"\nSaved → {lstm_path}")
-print(results_df[["city","Train_RMSE","Train_MAE","Train_MAPE",
-                   "Test_RMSE","Test_MAE","Test_MAPE"]].to_string(index=False))
 
-# ── Plot lstm_forecasts.png ──────────────────────────────────
+# ── Print test-set table ──────────────────────────────────────
+print("\n" + "=" * 65)
+print("TEST-SET METRICS PER CITY")
+print("=" * 65)
+print(f"{'City':<10}  {'RMSE':>10}  {'MAE':>10}  {'MAPE':>8}  {'R²':>8}")
+print("-" * 55)
+for _, row in results_df.iterrows():
+    print(f"{row.city:<10}  {row.Test_RMSE:>10.2f}  {row.Test_MAE:>10.2f}  "
+          f"{row.Test_MAPE:>7.2f}%  {row.Test_R2:>8.4f}")
+print("=" * 65)
+
+# ── SARIMA R² on the same single train/test split ────────────
+sarima_orders = (
+    pd.read_csv(SARIMA_CSV)[["city", "p", "d", "q", "P", "D", "Q"]]
+    .set_index("city")
+    .astype(int)
+)
+
+print("\n" + "=" * 65)
+print("SARIMA vs LSTM — SINGLE-SPLIT TEST R² PER CITY")
+print("=" * 65)
+print(f"{'City':<10}  {'SARIMA R²':>12}  {'LSTM R²':>12}  {'Δ (LSTM−SARIMA)':>16}")
+print("-" * 55)
+
+for city in CITIES:
+    city_df  = df[df["city"] == city].reset_index(drop=True)
+    series   = city_df["tourist_volume"].values.astype(float)
+    n        = len(series)
+    train    = series[: n - TEST_N]
+    test     = series[n - TEST_N :]
+
+    o = sarima_orders.loc[city]
+    try:
+        mdl = pm.ARIMA(
+            order=(o.p, o.d, o.q),
+            seasonal_order=(o.P, o.D, o.Q, 12),
+            suppress_warnings=True,
+        )
+        mdl.fit(train)
+        s_fc = np.maximum(mdl.predict(n_periods=TEST_N), 0)
+        s_r2 = float(r2_score(test, s_fc))
+    except Exception as exc:
+        print(f"  {city}: SARIMA fit failed — {exc}")
+        s_r2 = float("nan")
+
+    l_r2  = results_df.loc[results_df["city"] == city, "Test_R2"].iloc[0]
+    delta = l_r2 - s_r2
+    print(f"{city:<10}  {s_r2:>+12.4f}  {l_r2:>+12.4f}  {delta:>+16.4f}")
+
+print("=" * 65)
+
+# ── Plot lstm_forecasts.png ───────────────────────────────────
 fig, axes = plt.subplots(5, 1, figsize=(14, 18), sharex=False)
 fig.suptitle(
     "LSTM Forecasts vs Actual — Monthly Tourist Volume\n"
-    "(Hold-out test: last 12 months | Architecture: LSTM(64,32) + Dropout(0.2))",
+    "(Hold-out test: last 12 months | seas_diff(12) | LSTM(16,8) + Dropout(0.2))",
     fontsize=13, fontweight="bold", y=0.98,
 )
 
@@ -200,40 +279,30 @@ for ax, city in zip(axes, CITIES):
     art   = city_artifacts[city]
     color = CITY_COLORS[city]
 
-    train_dates = pd.to_datetime(art["train_dates"])
-    test_dates  = pd.to_datetime(art["test_dates"])
+    train_dates   = pd.to_datetime(art["train_dates"])
+    test_dates    = pd.to_datetime(art["test_dates"])
+    insamp_dates  = pd.to_datetime(art["insample_dates"])
 
-    # Full train actual
     ax.plot(train_dates, art["train"],
             color=color, linewidth=1.5, label="Actual (train)", alpha=0.8)
-
-    # In-sample fitted (starts at month SEQ_LEN)
-    ax.plot(train_dates[SEQ_LEN:], art["train_pred"],
+    ax.plot(insamp_dates, art["train_pred"],
             color="grey", linewidth=1.0, linestyle="--",
             label="LSTM fitted", alpha=0.7)
-
-    # Test actual
     ax.plot(test_dates, art["test"],
             color=color, linewidth=2.2, linestyle="-",
             marker="o", markersize=5, label="Actual (test)")
-
-    # Test forecast
     ax.plot(test_dates, art["test_pred"],
             color="black", linewidth=2.0, linestyle="--",
             marker="s", markersize=4, label="LSTM forecast")
-
-    # COVID shading
     ax.axvspan(pd.Timestamp("2020-03-01"), pd.Timestamp("2020-12-01"),
                color="red", alpha=0.07, label="COVID period")
-
-    # Train/test split line
     ax.axvline(x=test_dates[0], color="navy", linewidth=1.2,
                linestyle=":", alpha=0.8)
 
     row = results_df[results_df["city"] == city].iloc[0]
-    metrics_str = (f"Test  RMSE={row.Test_RMSE:.1f}  "
-                   f"MAE={row.Test_MAE:.1f}  MAPE={row.Test_MAPE:.1f}%")
-    ax.set_title(f"{city} — LSTM(64,32)  |  {metrics_str}",
+    metrics_str = (f"RMSE={row.Test_RMSE:.1f}  MAE={row.Test_MAE:.1f}  "
+                   f"MAPE={row.Test_MAPE:.1f}%  R²={row.Test_R2:.3f}")
+    ax.set_title(f"{city} — LSTM(16,8)  |  {metrics_str}",
                  fontsize=10, fontweight="bold", loc="left")
     ax.set_ylabel("Tourist Volume", fontsize=8)
     ax.xaxis.set_major_locator(mdates.MonthLocator(bymonth=[1, 7]))
@@ -261,18 +330,18 @@ sarima_raw.columns = [
 ]
 lstm_ren = results_df.rename(columns={
     "Train_RMSE": "LSTM_Train_RMSE", "Train_MAE": "LSTM_Train_MAE",
-    "Train_MAPE": "LSTM_Train_MAPE",
+    "Train_MAPE": "LSTM_Train_MAPE", "Train_R2":  "LSTM_Train_R2",
     "Test_RMSE":  "LSTM_Test_RMSE",  "Test_MAE":  "LSTM_Test_MAE",
-    "Test_MAPE":  "LSTM_Test_MAPE",
+    "Test_MAPE":  "LSTM_Test_MAPE",  "Test_R2":   "LSTM_Test_R2",
 })
-vs_df    = sarima_raw.merge(lstm_ren, on="city")
-vs_path  = os.path.join(OUTPUT_DIR, "lstm_vs_sarima.csv")
+vs_df   = sarima_raw.merge(lstm_ren, on="city")
+vs_path = os.path.join(OUTPUT_DIR, "lstm_vs_sarima.csv")
 vs_df.to_csv(vs_path, index=False)
 print(f"Saved → {vs_path}")
 
 # ── MAPE comparison bar chart — lstm_comparison.png ──────────
-x      = np.arange(len(CITIES))
-width  = 0.35
+x     = np.arange(len(CITIES))
+width = 0.35
 
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
 fig.suptitle("SARIMA vs LSTM — MAPE Comparison per City",
@@ -313,10 +382,10 @@ plt.close()
 print(f"Saved → {comp_path}")
 
 # ── Final summary ─────────────────────────────────────────────
-print("\n" + "=" * 60)
+print("\n" + "=" * 65)
 print("PHASE 3 COMPLETE — Output files:")
 for fname in ["lstm_results_full.csv", "lstm_forecasts.png",
               "lstm_vs_sarima.csv", "lstm_comparison.png"]:
     fpath = os.path.join(OUTPUT_DIR, fname)
     print(f"  {fname:35s}  {os.path.getsize(fpath):>8,} bytes")
-print("=" * 60)
+print("=" * 65)

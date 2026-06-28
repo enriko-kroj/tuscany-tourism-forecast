@@ -3,19 +3,19 @@ os.environ["PYTHONHASHSEED"] = "42"
 os.environ["TF_DETERMINISTIC_OPS"] = "1"
 
 """
-BSP4 Phase 4: Walk-Forward Rolling Window Validation
+BSP4 Phase 4: Walk-Forward Rolling Window Validation — v2
 - Train window: 36 months  |  Test window: 12 months  |  Slide: 1 month
 - 67 months total → 20 windows
   First window : train Jan2019–Dec2021, test Jan2022–Dec2022
   Last window  : train Aug2020–Jul2023, test Aug2023–Jul2024
 - SARIMA: fixed orders from phase2 (sarima_results_full.csv), re-fit per window
-- LSTM : LSTM(64,32)+Dropout(0.2), seq_len=12, same as phase3
-- R²   : pooled across all 20 windows (single value per city per model)
+- LSTM : seas_diff(12) + LSTM(16,8)+Dropout(0.2), seq_len=12
+- R²   : computed PER WINDOW, reported as mean ± std across 20 windows
 - Outputs: rolling_window_results.csv, rolling_window_plot.png,
            rolling_window_r2_plot.png
 """
 
-import os, warnings
+import warnings
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -31,9 +31,7 @@ from tensorflow.keras.callbacks import EarlyStopping
 
 import random
 random.seed(42)
-import numpy as np
 np.random.seed(42)
-import tensorflow as tf
 tf.random.set_seed(42)
 
 warnings.filterwarnings("ignore")
@@ -49,6 +47,7 @@ OUTPUT_DIR = os.path.expanduser("~/Desktop/BSP4_Statistics")
 CITIES     = ["Arezzo", "Firenze", "Lucca", "Pisa", "Siena"]
 TRAIN_W    = 36
 TEST_W     = 12
+SEAS_LAG   = 12
 SEQ_LEN    = 12
 EPOCHS     = 500
 BATCH_SIZE = 16
@@ -112,14 +111,18 @@ print("PHASE 4: ROLLING WINDOW WALK-FORWARD VALIDATION")
 print("=" * 65)
 print(f"  Months per city : {n_months}")
 print(f"  Windows         : {n_windows}  (train={TRAIN_W}, test={TEST_W}, slide=1)")
-print(f"  Cities × windows: {len(CITIES) * n_windows}  SARIMA fits + {len(CITIES) * n_windows} LSTM fits")
+print(f"  LSTM            : seas_diff(12), LSTM(16,8), dropout=0.2")
+print(f"  R²              : per-window, reported as mean ± std")
 print("=" * 65)
 
 # ─────────────────────────────────────────────
 # WALK-FORWARD LOOP
 # ─────────────────────────────────────────────
-all_rows  = []
-pooled_r2 = {}   # city → {"sarima": float, "lstm": float}
+all_rows = []
+
+# Per-city per-window R² accumulators
+city_sarima_r2 = {c: [] for c in CITIES}
+city_lstm_r2   = {c: [] for c in CITIES}
 
 for city in CITIES:
     print(f"\n{'─'*65}")
@@ -134,12 +137,8 @@ for city in CITIES:
     s_order    = (o.p, o.d, o.q)
     s_seasonal = (o.P, o.D, o.Q, 12)
 
-    # Accumulators for pooled R²
-    sarima_actuals, sarima_preds = [], []
-    lstm_actuals,   lstm_preds   = [], []
-
     for w in range(n_windows):
-        tr_sl = slice(w,          w + TRAIN_W)
+        tr_sl = slice(w,           w + TRAIN_W)
         te_sl = slice(w + TRAIN_W, w + TRAIN_W + TEST_W)
 
         train = series[tr_sl]
@@ -152,6 +151,7 @@ for city in CITIES:
         print(f"  W{w+1:02d}: {t0}–{t1} | test {e0}–{e1}", end="  ", flush=True)
 
         # ── SARIMA (fixed orders) ─────────────────────────────
+        s_r2 = np.nan
         try:
             sarima_mdl = pm.ARIMA(
                 order=s_order,
@@ -163,24 +163,27 @@ for city in CITIES:
             s_rmse = rmse(test, s_fc)
             s_mae  = mae(test, s_fc)
             s_mape = mape(test, s_fc)
-            sarima_actuals.extend(test.tolist())
-            sarima_preds.extend(s_fc.tolist())
+            s_r2   = float(r2_score(test, s_fc))
+            city_sarima_r2[city].append(s_r2)
         except Exception as exc:
             print(f"SARIMA ERR: {exc}", end="  ")
             s_rmse = s_mae = s_mape = np.nan
 
-        # ── LSTM ──────────────────────────────────────────────
-        scaler   = MinMaxScaler()
-        train_sc = scaler.fit_transform(train.reshape(-1, 1)).flatten()
+        # ── LSTM with seasonal differencing ───────────────────
+        # diff_train[j] = train[j+12] - train[j], j = 0..TRAIN_W-13
+        diff_train = train[SEAS_LAG:] - train[:-SEAS_LAG]   # length TRAIN_W - 12 = 24
 
-        X_tr, y_tr = make_sequences(train_sc, SEQ_LEN)
+        scaler        = MinMaxScaler()
+        diff_train_sc = scaler.fit_transform(diff_train.reshape(-1, 1)).flatten()
+
+        X_tr, y_tr = make_sequences(diff_train_sc, SEQ_LEN)
         X_tr = X_tr.reshape(X_tr.shape[0], SEQ_LEN, 1)
 
         tf.random.set_seed(SEED)
         lstm_mdl = Sequential([
-            LSTM(64, return_sequences=True, input_shape=(SEQ_LEN, 1)),
+            LSTM(16, return_sequences=True, input_shape=(SEQ_LEN, 1)),
             Dropout(0.2),
-            LSTM(32),
+            LSTM(8),
             Dropout(0.2),
             Dense(1),
         ])
@@ -198,27 +201,36 @@ for city in CITIES:
             verbose=0,
         )
 
-        # Rolling multi-step forecast
-        rolling = list(train_sc[-SEQ_LEN:])
-        pred_sc = []
+        # Rolling multi-step forecast in differenced space
+        rolling = list(diff_train_sc[-SEQ_LEN:])
+        pred_diff_sc = []
         for _ in range(TEST_W):
             x_in = np.array(rolling[-SEQ_LEN:]).reshape(1, SEQ_LEN, 1)
             p    = lstm_mdl.predict(x_in, verbose=0)[0, 0]
-            pred_sc.append(p)
+            pred_diff_sc.append(p)
             rolling.append(p)
 
-        l_fc = np.maximum(
-            scaler.inverse_transform(np.array(pred_sc).reshape(-1, 1)).flatten(), 0
-        )
+        pred_diff = scaler.inverse_transform(
+            np.array(pred_diff_sc).reshape(-1, 1)
+        ).flatten()
+
+        # Invert seasonal differencing:
+        # test_pred[k] = pred_diff[k] + series[t-12]
+        # where t = w + TRAIN_W + k, so series[t-12] = train[TRAIN_W - SEAS_LAG + k]
+        # = train[-TEST_W + k]  (since SEAS_LAG == TEST_W == 12)
+        l_fc = pred_diff + train[TRAIN_W - SEAS_LAG :]
+        l_fc = np.maximum(l_fc, 0)
+
         l_rmse = rmse(test, l_fc)
         l_mae  = mae(test, l_fc)
         l_mape = mape(test, l_fc)
-        lstm_actuals.extend(test.tolist())
-        lstm_preds.extend(l_fc.tolist())
+        l_r2   = float(r2_score(test, l_fc))
+        city_lstm_r2[city].append(l_r2)
 
         tf.keras.backend.clear_session()
 
-        print(f"SARIMA MAPE={s_mape:.1f}%  LSTM MAPE={l_mape:.1f}%")
+        print(f"SARIMA MAPE={s_mape:.1f}% R²={s_r2:.3f}  |  "
+              f"LSTM MAPE={l_mape:.1f}% R²={l_r2:.3f}")
 
         all_rows.append({
             "city":          city,
@@ -230,27 +242,17 @@ for city in CITIES:
             "sarima_rmse":   round(s_rmse, 2),
             "sarima_mae":    round(s_mae,  2),
             "sarima_mape":   round(s_mape, 2),
+            "sarima_r2":     round(s_r2,   4) if not np.isnan(s_r2) else np.nan,
             "lstm_rmse":     round(l_rmse, 2),
             "lstm_mae":      round(l_mae,  2),
             "lstm_mape":     round(l_mape, 2),
+            "lstm_r2":       round(l_r2,   4),
         })
 
-    # Pooled R² across all windows for this city
-    s_pooled = float(r2_score(sarima_actuals, sarima_preds)) if sarima_actuals else np.nan
-    l_pooled = float(r2_score(lstm_actuals,   lstm_preds))   if lstm_actuals   else np.nan
-    pooled_r2[city] = {"sarima": s_pooled, "lstm": l_pooled}
-    print(f"  → Pooled R²:  SARIMA={s_pooled:.4f}  LSTM={l_pooled:.4f}")
-
 # ─────────────────────────────────────────────
-# BUILD DATAFRAME & MERGE POOLED R²
+# BUILD DATAFRAME
 # ─────────────────────────────────────────────
 results_df = pd.DataFrame(all_rows)
-
-r2_lookup = pd.DataFrame([
-    {"city": c, "sarima_pooled_r2": round(v["sarima"], 4), "lstm_pooled_r2": round(v["lstm"], 4)}
-    for c, v in pooled_r2.items()
-])
-results_df = results_df.merge(r2_lookup, on="city", how="left")
 
 # ─────────────────────────────────────────────
 # SAVE CSV
@@ -269,7 +271,8 @@ tick_labels = first_city_rows["test_start"].tolist()
 fig, axes = plt.subplots(5, 1, figsize=(14, 18), sharex=True)
 fig.suptitle(
     f"Walk-Forward Rolling Window Validation — MAPE per Window\n"
-    f"(Train={TRAIN_W}m, Test={TEST_W}m, slide=1m, {n_windows} windows | 5 Tuscan cities)",
+    f"(Train={TRAIN_W}m, Test={TEST_W}m, slide=1m, {n_windows} windows | "
+    f"seas_diff(12) | LSTM(16,8))",
     fontsize=13, fontweight="bold", y=0.99,
 )
 
@@ -277,15 +280,18 @@ for ax, city in zip(axes, CITIES):
     city_res = results_df[results_df["city"] == city].sort_values("window_number")
     s_mapes  = city_res["sarima_mape"].values
     l_mapes  = city_res["lstm_mape"].values
-    s_mean, l_mean = np.nanmean(s_mapes), np.nanmean(l_mapes)
+    s_mean = np.nanmean(s_mapes); s_std = np.nanstd(s_mapes)
+    l_mean = np.nanmean(l_mapes); l_std = np.nanstd(l_mapes)
 
-    ax.plot(windows, s_mapes, color="#4e79a7", linewidth=1.8, marker="o", markersize=4, label="SARIMA")
-    ax.plot(windows, l_mapes, color="#f28e2b", linewidth=1.8, marker="s", markersize=4, label="LSTM")
+    ax.plot(windows, s_mapes, color="#4e79a7", linewidth=1.8,
+            marker="o", markersize=4, label="SARIMA")
+    ax.plot(windows, l_mapes, color="#f28e2b", linewidth=1.8,
+            marker="s", markersize=4, label="LSTM")
     ax.axhline(s_mean, color="#4e79a7", linestyle="--", linewidth=0.9, alpha=0.6)
     ax.axhline(l_mean, color="#f28e2b", linestyle="--", linewidth=0.9, alpha=0.6)
     ax.set_title(
-        f"{city} — SARIMA mean={s_mean:.1f}%  std={np.nanstd(s_mapes):.1f}%   |   "
-        f"LSTM mean={l_mean:.1f}%  std={np.nanstd(l_mapes):.1f}%",
+        f"{city} — SARIMA {s_mean:.1f}±{s_std:.1f}%   |   "
+        f"LSTM {l_mean:.1f}±{l_std:.1f}%",
         fontsize=9, fontweight="bold", loc="left",
     )
     ax.set_ylabel("MAPE (%)", fontsize=8)
@@ -303,23 +309,30 @@ plt.close()
 print(f"Saved → {plot_path}")
 
 # ─────────────────────────────────────────────
-# PLOT 2: rolling_window_r2_plot.png  (pooled R² bar chart)
+# PLOT 2: rolling_window_r2_plot.png  (R² mean ± std bar chart)
 # ─────────────────────────────────────────────
-x      = np.arange(len(CITIES))
-width  = 0.35
-s_r2s  = [pooled_r2[c]["sarima"] for c in CITIES]
-l_r2s  = [pooled_r2[c]["lstm"]   for c in CITIES]
+x     = np.arange(len(CITIES))
+width = 0.35
 
-fig, ax = plt.subplots(figsize=(10, 5))
-bars_s = ax.bar(x - width / 2, s_r2s, width, label="SARIMA", color="#4e79a7", edgecolor="white")
-bars_l = ax.bar(x + width / 2, l_r2s, width, label="LSTM",   color="#f28e2b", edgecolor="white")
+s_r2_means = [np.nanmean(city_sarima_r2[c]) for c in CITIES]
+s_r2_stds  = [np.nanstd(city_sarima_r2[c])  for c in CITIES]
+l_r2_means = [np.nanmean(city_lstm_r2[c])   for c in CITIES]
+l_r2_stds  = [np.nanstd(city_lstm_r2[c])    for c in CITIES]
+
+fig, ax = plt.subplots(figsize=(11, 5))
+bars_s = ax.bar(x - width / 2, s_r2_means, width, yerr=s_r2_stds,
+                label="SARIMA", color="#4e79a7", edgecolor="white",
+                capsize=4, alpha=0.85)
+bars_l = ax.bar(x + width / 2, l_r2_means, width, yerr=l_r2_stds,
+                label="LSTM",   color="#f28e2b", edgecolor="white",
+                capsize=4, alpha=0.85)
 
 ax.set_title(
-    f"Walk-Forward Rolling Window Validation — Pooled R² per City\n"
-    f"(Train={TRAIN_W}m, Test={TEST_W}m, slide=1m, {n_windows} windows pooled | 5 Tuscan cities)",
+    f"Walk-Forward Rolling Window — R² Mean ± Std per City\n"
+    f"(Train={TRAIN_W}m, Test={TEST_W}m, {n_windows} windows | seas_diff(12) | LSTM(16,8))",
     fontsize=12, fontweight="bold",
 )
-ax.set_ylabel("Pooled R²", fontsize=10)
+ax.set_ylabel("R² (mean ± std across windows)", fontsize=10)
 ax.set_xlabel("City", fontsize=10)
 ax.set_xticks(x)
 ax.set_xticklabels(CITIES, fontsize=10)
@@ -327,15 +340,16 @@ ax.axhline(0, color="black", linestyle=":", linewidth=0.9, alpha=0.6)
 ax.legend(fontsize=10)
 ax.grid(axis="y", linestyle="--", alpha=0.35)
 
-# Value labels on bars
-for bar in bars_s:
-    v = bar.get_height()
-    ax.text(bar.get_x() + bar.get_width() / 2, v + 0.01 if v >= 0 else v - 0.03,
-            f"{v:.3f}", ha="center", va="bottom" if v >= 0 else "top", fontsize=8)
-for bar in bars_l:
-    v = bar.get_height()
-    ax.text(bar.get_x() + bar.get_width() / 2, v + 0.01 if v >= 0 else v - 0.03,
-            f"{v:.3f}", ha="center", va="bottom" if v >= 0 else "top", fontsize=8)
+for bar, mean_val in zip(bars_s, s_r2_means):
+    ax.text(bar.get_x() + bar.get_width() / 2,
+            mean_val + 0.01 if mean_val >= 0 else mean_val - 0.03,
+            f"{mean_val:.3f}", ha="center",
+            va="bottom" if mean_val >= 0 else "top", fontsize=8)
+for bar, mean_val in zip(bars_l, l_r2_means):
+    ax.text(bar.get_x() + bar.get_width() / 2,
+            mean_val + 0.01 if mean_val >= 0 else mean_val - 0.03,
+            f"{mean_val:.3f}", ha="center",
+            va="bottom" if mean_val >= 0 else "top", fontsize=8)
 
 plt.tight_layout()
 r2_plot_path = os.path.join(OUTPUT_DIR, "rolling_window_r2_plot.png")
@@ -346,42 +360,35 @@ print(f"Saved → {r2_plot_path}")
 # ─────────────────────────────────────────────
 # SUMMARY TABLE
 # ─────────────────────────────────────────────
-print("\n" + "=" * 78)
+print("\n" + "=" * 82)
 print("ROLLING WINDOW SUMMARY — Mean ± Std across all windows per city")
-print("=" * 78)
+print("=" * 82)
 
-# Block 1: RMSE / MAE / MAPE (per-window averages)
-header = f"{'City':<10}  {'SARIMA':^33}  {'LSTM':^33}"
-sub    = f"{'':10}  {'RMSE':>10}  {'MAE':>10}  {'MAPE':>9}  {'RMSE':>10}  {'MAE':>10}  {'MAPE':>9}"
-print(header)
-print(sub)
-print("-" * 78)
+# MAPE mean ± std
+print(f"\n{'City':<10}  {'SARIMA MAPE':>16}  {'LSTM MAPE':>16}")
+print("-" * 46)
 for city in CITIES:
     r = results_df[results_df["city"] == city]
-    print(
-        f"{city:<10}  "
-        f"{r.sarima_rmse.mean():>7.1f}±{r.sarima_rmse.std():>5.1f}  "
-        f"{r.sarima_mae.mean():>7.1f}±{r.sarima_mae.std():>4.1f}  "
-        f"{r.sarima_mape.mean():>6.1f}±{r.sarima_mape.std():>4.1f}%  "
-        f"{r.lstm_rmse.mean():>7.1f}±{r.lstm_rmse.std():>5.1f}  "
-        f"{r.lstm_mae.mean():>7.1f}±{r.lstm_mae.std():>4.1f}  "
-        f"{r.lstm_mape.mean():>6.1f}±{r.lstm_mape.std():>4.1f}%"
-    )
+    s_mp = r["sarima_mape"]
+    l_mp = r["lstm_mape"]
+    print(f"{city:<10}  {s_mp.mean():>8.2f}±{s_mp.std():>5.2f}%  "
+          f"{l_mp.mean():>8.2f}±{l_mp.std():>5.2f}%")
 
-# Block 2: Pooled R² (single value per city)
-print()
-print("POOLED R² — Single value computed over all 20 windows combined")
-r2_header = f"{'City':<10}  {'SARIMA R²':>12}  {'LSTM R²':>12}"
-print(r2_header)
-print("-" * 38)
+# R² mean ± std (per-window)
+print(f"\n{'City':<10}  {'SARIMA R²':>18}  {'LSTM R²':>18}")
+print("-" * 50)
 for city in CITIES:
-    s_r2 = pooled_r2[city]["sarima"]
-    l_r2 = pooled_r2[city]["lstm"]
-    print(f"{city:<10}  {s_r2:>12.4f}  {l_r2:>12.4f}")
+    s_vals = city_sarima_r2[city]
+    l_vals = city_lstm_r2[city]
+    s_mean = np.nanmean(s_vals); s_std = np.nanstd(s_vals)
+    l_mean = np.nanmean(l_vals); l_std = np.nanstd(l_vals)
+    print(f"{city:<10}  {s_mean:>+9.4f}±{s_std:>6.4f}  "
+          f"{l_mean:>+9.4f}±{l_std:>6.4f}")
 
-print("=" * 78)
+print("=" * 82)
 print(f"\nPHASE 4 COMPLETE")
-for fname in ["rolling_window_results.csv", "rolling_window_plot.png", "rolling_window_r2_plot.png"]:
+for fname in ["rolling_window_results.csv", "rolling_window_plot.png",
+              "rolling_window_r2_plot.png"]:
     fpath = os.path.join(OUTPUT_DIR, fname)
     print(f"  {fname:38s}  {os.path.getsize(fpath):>8,} bytes")
-print("=" * 78)
+print("=" * 82)
